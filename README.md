@@ -36,7 +36,7 @@ CHAT_ID=ваш_id_в_телеграме
 ```
 
 > Токен бота — у [@BotFather](https://t.me/BotFather).
-> Ваш chat\_id — у [@userinfobot](https://t.me/userinfobot).
+> Ваш Telegram user ID (для личного чата с ботом он совпадает с chat\_id) — у [@userinfobot](https://t.me/userinfobot).
 
 **3. Запустить**
 
