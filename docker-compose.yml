@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    container_name: 3xui-notifier
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Сохраняем last_version.txt между перезапусками
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DATA_DIR=/app/data
