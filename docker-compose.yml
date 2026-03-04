@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      # Сохраняем last_version.txt между перезапусками
+      # Персистентное хранилище repos.json и versions.json
       - ./data:/app/data
     environment:
       - PYTHONUNBUFFERED=1
