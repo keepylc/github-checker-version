@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-3x-ui Release Notifier Bot
-Периодически проверяет новые релизы 3x-ui и отправляет уведомление в Telegram.
+GitHub Release Notifier Bot
+Следит за релизами GitHub-репозиториев и уведомляет в Telegram.
 """
 
 import html
+import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, filters
 
 load_dotenv()
 
@@ -26,30 +28,56 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))
-GITHUB_REPO = os.getenv("GITHUB_REPO", "MHSanaei/3x-ui")
 
 _data_dir = Path(os.getenv("DATA_DIR", "."))
 _data_dir.mkdir(parents=True, exist_ok=True)
-VERSION_FILE = _data_dir / "last_version.txt"
-GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+
+REPOS_FILE = _data_dir / "repos.json"
+VERSIONS_FILE = _data_dir / "versions.json"
+
+# owner/repo — допустимые символы для GitHub
+REPO_RE = re.compile(r"^[a-zA-Z0-9_.\-]+/[a-zA-Z0-9_.\-]+$")
 
 
-def load_last_version() -> str | None:
-    if VERSION_FILE.exists():
-        return VERSION_FILE.read_text().strip() or None
-    return None
+# ---------------------------------------------------------------------------
+# Хранилище
+# ---------------------------------------------------------------------------
 
 
-def save_version(version: str) -> None:
-    VERSION_FILE.write_text(version)
+def load_repos() -> list[str]:
+    if REPOS_FILE.exists():
+        data = json.loads(REPOS_FILE.read_text())
+        return data if isinstance(data, list) else []
+    # При первом запуске — берём значение из env (если есть)
+    default = os.getenv("GITHUB_REPO", "MHSanaei/3x-ui")
+    return [default]
 
 
-async def fetch_latest_release() -> dict:
-    """Получить информацию о последнем релизе через GitHub API."""
+def save_repos(repos: list[str]) -> None:
+    REPOS_FILE.write_text(json.dumps(repos, ensure_ascii=False, indent=2))
+
+
+def load_versions() -> dict[str, str]:
+    if VERSIONS_FILE.exists():
+        data = json.loads(VERSIONS_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    return {}
+
+
+def save_versions(versions: dict[str, str]) -> None:
+    VERSIONS_FILE.write_text(json.dumps(versions, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# GitHub API
+# ---------------------------------------------------------------------------
+
+
+async def fetch_latest_release(repo: str) -> dict:
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.get(
-            GITHUB_API_URL,
+            url,
             headers={"Accept": "application/vnd.github+json"},
             follow_redirects=True,
         )
@@ -57,61 +85,87 @@ async def fetch_latest_release() -> dict:
         return response.json()
 
 
-def format_release_message(release: dict) -> str:
+def format_release_message(repo: str, release: dict, *, old_version: str | None = None) -> str:
     tag = html.escape(release.get("tag_name", "unknown"))
     name = html.escape(release.get("name") or release.get("tag_name", ""))
-    html_url = release.get("html_url", GITHUB_RELEASES_URL)
+    html_url = release.get("html_url", f"https://github.com/{repo}/releases")
     published = release.get("published_at", "")[:10]
+    is_prerelease = release.get("prerelease", False)
 
     body = (release.get("body") or "").strip()
-    if len(body) > 800:
-        body = body[:800] + "…"
+    if len(body) > 3000:
+        body = body[:3000] + "\n…"
 
-    lines = [
-        f"🚀 <b>Новый релиз {html.escape(GITHUB_REPO)}</b>",
+    header = "🔖 Pre-release" if is_prerelease else "🚀 Новый релиз"
+    parts = [
+        f"{header} <b>{html.escape(repo)}</b>",
         "",
         f"<b>Версия:</b> <code>{tag}</code>",
+    ]
+
+    if old_version:
+        parts.append(f"<b>Предыдущая:</b> <code>{html.escape(old_version)}</code>")
+
+    parts += [
         f"<b>Название:</b> {name}",
         f"<b>Дата:</b> {published}",
     ]
 
     if body:
-        lines += ["", "<b>Что нового:</b>", f"<pre>{html.escape(body)}</pre>"]
+        parts += ["", "<b>Описание релиза:</b>", f"<pre>{html.escape(body)}</pre>"]
 
-    lines += ["", f'<a href="{html_url}">Открыть релиз на GitHub</a>']
+    parts += ["", f'<a href="{html_url}">Открыть на GitHub</a>']
 
-    return "\n".join(lines)
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Фоновая проверка
+# ---------------------------------------------------------------------------
 
 
 async def check_for_update(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Задача планировщика: проверить новый релиз и уведомить."""
-    logger.info("Проверяем новый релиз...")
-    try:
-        release = await fetch_latest_release()
-        latest = release["tag_name"]
-        last = load_last_version()
+    repos = load_repos()
+    if not repos:
+        logger.info("Нет репозиториев для проверки.")
+        return
 
-        if last is None:
-            save_version(latest)
-            logger.info("Первый запуск, запомнили версию: %s", latest)
-            return
+    logger.info("Проверяем %d репозитори(ев)...", len(repos))
+    versions = load_versions()
+    changed = False
 
-        if latest != last:
-            logger.info("Новая версия найдена: %s → %s", last, latest)
-            save_version(latest)
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=format_release_message(release),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False,
-            )
-        else:
-            logger.info("Версия не изменилась: %s", latest)
+    for repo in repos:
+        try:
+            release = await fetch_latest_release(repo)
+            latest = release["tag_name"]
+            last = versions.get(repo)
 
-    except httpx.HTTPStatusError as e:
-        logger.error("HTTP ошибка при запросе GitHub API: %s", e)
-    except Exception as e:
-        logger.exception("Неожиданная ошибка при проверке релиза: %s", e)
+            if last is None:
+                versions[repo] = latest
+                changed = True
+                logger.info("[%s] Первый запуск, запомнили: %s", repo, latest)
+                continue
+
+            if latest != last:
+                logger.info("[%s] Новая версия: %s → %s", repo, last, latest)
+                versions[repo] = latest
+                changed = True
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=format_release_message(repo, release, old_version=last),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=False,
+                )
+            else:
+                logger.info("[%s] Без изменений: %s", repo, latest)
+
+        except httpx.HTTPStatusError as e:
+            logger.error("[%s] HTTP ошибка: %s", repo, e)
+        except Exception as e:
+            logger.exception("[%s] Ошибка: %s", repo, e)
+
+    if changed:
+        save_versions(versions)
 
 
 # ---------------------------------------------------------------------------
@@ -120,62 +174,162 @@ async def check_for_update(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    last = load_last_version()
-    version_info = (
-        f"Отслеживаемая версия: <code>{html.escape(last)}</code>"
-        if last
-        else "Версия ещё не определена."
-    )
+    repos = load_repos()
+    count = len(repos)
     text = (
-        f"<b>3x-ui Release Notifier</b> запущен.\n\n"
-        f"{version_info}\n\n"
-        f"Уведомления → чат <code>{CHAT_ID}</code>\n"
+        f"<b>GitHub Release Notifier</b> запущен.\n\n"
+        f"Отслеживается репозиториев: <b>{count}</b>\n"
         f"Интервал проверки: <b>{CHECK_INTERVAL // 60} мин.</b>\n\n"
         f"Команды:\n"
-        f"/check — проверить прямо сейчас\n"
-        f"/version — текущая отслеживаемая версия"
+        f"/list — список отслеживаемых репозиториев\n"
+        f"/add owner/repo — добавить репозиторий\n"
+        f"/remove owner/repo — удалить репозиторий\n"
+        f"/check — проверить все репозитории прямо сейчас"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    last = load_last_version()
-    if last:
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    repos = load_repos()
+    versions = load_versions()
+
+    if not repos:
+        await update.message.reply_text("Список пуст. Добавь репозиторий: /add owner/repo")
+        return
+
+    lines = ["<b>Отслеживаемые репозитории:</b>", ""]
+    for repo in repos:
+        ver = versions.get(repo, "не проверялся")
+        lines.append(f"• <code>{html.escape(repo)}</code> — <code>{html.escape(ver)}</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Использование: /add owner/repo")
+        return
+
+    repo = context.args[0].strip().strip("/")
+
+    if not REPO_RE.match(repo):
         await update.message.reply_text(
-            f"Последняя известная версия: <code>{html.escape(last)}</code>",
+            f"Неверный формат. Ожидается: <code>owner/repo</code>",
             parse_mode=ParseMode.HTML,
         )
-    else:
-        await update.message.reply_text("Версия ещё не определена. Подожди первой проверки.")
+        return
+
+    repos = load_repos()
+    if repo in repos:
+        await update.message.reply_text(
+            f"<code>{html.escape(repo)}</code> уже отслеживается.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await update.message.reply_text("Проверяю репозиторий на GitHub…")
+    try:
+        release = await fetch_latest_release(repo)
+        latest = release["tag_name"]
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            await update.message.reply_text(
+                f"Репозиторий <code>{html.escape(repo)}</code> не найден или у него нет релизов.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(f"Ошибка GitHub API: {e.response.status_code}")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        return
+
+    repos.append(repo)
+    save_repos(repos)
+
+    versions = load_versions()
+    versions[repo] = latest
+    save_versions(versions)
+
+    await update.message.reply_text(
+        f"Добавлен <code>{html.escape(repo)}</code>.\n"
+        f"Текущая версия: <code>{html.escape(latest)}</code>\n\n"
+        f"Уведомление придёт при следующем релизе.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Использование: /remove owner/repo")
+        return
+
+    repo = context.args[0].strip().strip("/")
+    repos = load_repos()
+
+    if repo not in repos:
+        await update.message.reply_text(
+            f"<code>{html.escape(repo)}</code> не найден в списке.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    repos.remove(repo)
+    save_repos(repos)
+
+    versions = load_versions()
+    versions.pop(repo, None)
+    save_versions(versions)
+
+    await update.message.reply_text(
+        f"<code>{html.escape(repo)}</code> удалён из отслеживания.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Проверяю GitHub…")
-    try:
-        release = await fetch_latest_release()
-        latest = release["tag_name"]
-        last = load_last_version()
+    repos = load_repos()
+    if not repos:
+        await update.message.reply_text("Список пуст. Добавь репозиторий: /add owner/repo")
+        return
 
-        if last is None:
-            save_version(latest)
-            await update.message.reply_text(
-                f"Первая проверка. Запомнил версию: <code>{html.escape(latest)}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-        elif latest != last:
-            save_version(latest)
-            await update.message.reply_text(
-                format_release_message(release),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False,
-            )
-        else:
-            await update.message.reply_text(
-                f"Новых версий нет. Текущая: <code>{html.escape(latest)}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(f"Проверяю {len(repos)} репозитори(ев)…")
+    versions = load_versions()
+    changed = False
+    results: list[str] = []
+
+    for repo in repos:
+        try:
+            release = await fetch_latest_release(repo)
+            latest = release["tag_name"]
+            last = versions.get(repo)
+
+            if last is None:
+                versions[repo] = latest
+                changed = True
+                results.append(f"• <code>{html.escape(repo)}</code> — запомнена версия <code>{html.escape(latest)}</code>")
+            elif latest != last:
+                versions[repo] = latest
+                changed = True
+                results.append(f"• <code>{html.escape(repo)}</code> — новая версия <code>{html.escape(latest)}</code>!")
+                await update.message.reply_text(
+                    format_release_message(repo, release, old_version=last),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=False,
+                )
+            else:
+                results.append(f"• <code>{html.escape(repo)}</code> — без изменений (<code>{html.escape(latest)}</code>)")
+
+        except httpx.HTTPStatusError as e:
+            results.append(f"• <code>{html.escape(repo)}</code> — ошибка HTTP {e.response.status_code}")
+        except Exception as e:
+            results.append(f"• <code>{html.escape(repo)}</code> — ошибка: {html.escape(str(e))}")
+
+    if changed:
+        save_versions(versions)
+
+    summary = "<b>Результат проверки:</b>\n\n" + "\n".join(results)
+    await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
@@ -184,19 +338,25 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    logger.info("Запуск бота (репо: %s, интервал: %ds)", GITHUB_REPO, CHECK_INTERVAL)
+    logger.info("Запуск бота (интервал: %ds, chat_id: %d)", CHECK_INTERVAL, CHAT_ID)
+
+    # Инициализируем repos.json при первом запуске
+    if not REPOS_FILE.exists():
+        save_repos(load_repos())
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("version", cmd_version))
-    app.add_handler(CommandHandler("check", cmd_check))
+    only = filters.Chat(CHAT_ID)
+    app.add_handler(CommandHandler("start", cmd_start, filters=only))
+    app.add_handler(CommandHandler("list", cmd_list, filters=only))
+    app.add_handler(CommandHandler("add", cmd_add, filters=only))
+    app.add_handler(CommandHandler("remove", cmd_remove, filters=only))
+    app.add_handler(CommandHandler("check", cmd_check, filters=only))
 
-    # Периодическая проверка
     app.job_queue.run_repeating(
         check_for_update,
         interval=CHECK_INTERVAL,
-        first=10,  # первый запуск через 10 секунд после старта
+        first=10,
     )
 
     logger.info("Бот запущен. Ctrl+C для остановки.")

@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 
-# Папка для хранения last_version.txt (удобно монтировать как volume)
-VOLUME ["/app"]
+# Папка для хранения repos.json и versions.json (монтируется как volume)
+VOLUME ["/app/data"]
 
 CMD ["python", "-u", "bot.py"]
